@@ -1,8 +1,11 @@
 [package]
 name = "cuda-deliberation"
-version = "0.2.0"
+version = "0.1.0"
 edition = "2021"
-description = "Consider/Resolve/Forfeit deliberation protocol — uses cuda-equipment"
+description = "Consider/Resolve/Forfeit deliberation protocol — proposal lifecycle, voting, consensus, auto-forfeit"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Lucineer/cuda-deliberation"
+keywords = ["ai", "fleet", "agent"]
 
 [dependencies]
-# cuda-equipment = { path = "../cuda-equipment" }
+cuda-equipment = { path = "../cuda-equipment" }

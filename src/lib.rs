@@ -1,141 +1,201 @@
-//! Deliberation Protocol — Consider/Resolve/Forfeit
-//! Multi-agent consensus engine with confidence propagation.
+//! # cuda-deliberation
+//!
+//! Consider/Resolve/Forfeit deliberation protocol.
+//! Every proposal passes through agents who can accept, reject, or abstain.
+//!
+//! ```rust
+//! use cuda_deliberation::{DeliberationEngine, Proposal, ProposalState};
+//! use cuda_equipment::{Confidence, VesselId};
+//!
+//! let mut engine = DeliberationEngine::new(0.3); // forfeit gap threshold
+//! let id = engine.propose("adopt_rust", VesselId(0), "Switch to Rust");
+//! engine.consider(id, VesselId(1), Confidence::LIKELY);
+//! engine.resolve(id, VesselId(1), true);
+//! ```
+
+pub use cuda_equipment::{Confidence, VesselId, FleetMessage, MessageType, Agent};
 
 use std::collections::HashMap;
 
-/// A deliberation proposal from an agent
+/// Lifecycle states of a proposal.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ProposalState {
+    Proposed,
+    UnderConsideration,
+    Accepted,
+    Rejected,
+    Forfeited,
+    Expired,
+}
+
+/// A proposal being deliberated.
 #[derive(Debug, Clone)]
 pub struct Proposal {
     pub id: u64,
-    pub agent: String,
-    pub approach: String,
-    pub code: String,
-    pub confidence: f64,
-    pub constraints_met: Vec<String>,
-    pub constraints_violated: Vec<String>,
-    pub forfeited: bool,
+    pub title: String,
+    pub description: String,
+    pub proposer: VesselId,
+    pub state: ProposalState,
+    pub confidence: Confidence,
+    pub votes_for: Vec<(VesselId, Confidence)>,
+    pub votes_against: Vec<(VesselId, Confidence)>,
+    pub abstentions: Vec<VesselId>,
+    pub round: u32,
+    pub created_at: u64,
+    pub resolved_at: Option<u64>,
 }
 
-/// Deliberation state for a single intent
-pub struct DeliberationState {
-    proposals: Vec<Proposal>,
-    round: usize,
-    max_rounds: usize,
-    convergence_threshold: f64,
-    history: Vec<RoundRecord>,
-}
-
-#[derive(Debug, Clone)]
-pub struct RoundRecord {
-    pub round: usize,
-    pub proposals_count: usize,
-    pub best_confidence: f64,
-    pub forfeits: usize,
-    pub converged: bool,
-}
-
-impl DeliberationState {
-    pub fn new(max_rounds: usize, threshold: f64) -> Self {
-        Self {
-            proposals: vec![], round: 0, max_rounds, convergence_threshold: threshold,
-            history: vec![],
-        }
+impl Proposal {
+    pub fn new(id: u64, title: &str, description: &str, proposer: VesselId) -> Self {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        Self { id, title: title.to_string(), description: description.to_string(), proposer,
+            state: ProposalState::Proposed, confidence: Confidence::HALF,
+            votes_for: vec![], votes_against: vec![], abstentions: vec![],
+            round: 0, created_at: SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64),
+            resolved_at: None }
     }
 
-    /// Submit a proposal for consideration
-    pub fn consider(&mut self, agent: &str, approach: &str, code: &str, confidence: f64) -> u64 {
-        let id = self.proposals.len() as u64;
-        self.proposals.push(Proposal {
-            id, agent: agent.to_string(), approach: approach.to_string(),
-            code: code.to_string(), confidence,
-            constraints_met: vec![], constraints_violated: vec![], forfeited: false,
-        });
+    pub fn support_count(&self) -> usize { self.votes_for.len() }
+    pub fn oppose_count(&self) -> usize { self.votes_against.len() }
+    pub fn total_votes(&self) -> usize { self.votes_for.len() + self.votes_against.len() }
+
+    pub fn consensus_ratio(&self) -> f64 {
+        let total = self.total_votes();
+        if total == 0 { return 0.5; }
+        self.votes_for.len() as f64 / total as f64
+    }
+
+    pub fn has_voted(&self, vessel: VesselId) -> bool {
+        self.votes_for.iter().any(|(v, _)| *v == vessel)
+            || self.votes_against.iter().any(|(v, _)| *v == vessel)
+            || self.abstentions.contains(&vessel)
+    }
+}
+
+/// The deliberation engine — manages proposal lifecycle.
+pub struct DeliberationEngine {
+    proposals: HashMap<u64, Proposal>,
+    next_id: u64,
+    forfeit_gap: f64, // auto-forfeit when confidence gap exceeds this
+    max_rounds: u32,
+}
+
+impl DeliberationEngine {
+    pub fn new(forfeit_gap: f64) -> Self {
+        Self { proposals: HashMap::new(), next_id: 1, forfeit_gap, max_rounds: 20 }
+    }
+
+    /// Create a new proposal.
+    pub fn propose(&mut self, title: &str, proposer: VesselId, description: &str) -> u64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        let p = Proposal::new(id, title, description, proposer);
+        self.proposals.insert(id, p);
         id
     }
 
-    /// Resolve: mark constraints as met or violated for a proposal
-    pub fn resolve(&mut self, proposal_id: u64, met: Vec<String>, violated: Vec<String>) {
-        if let Some(p) = self.proposals.get_mut(proposal_id as usize) {
-            p.constraints_met = met;
-            p.constraints_violated = violated;
-            // Adjust confidence based on violations
-            let penalty = p.constraints_violated.len() as f64 * 0.15;
-            p.confidence = (p.confidence - penalty).max(0.1);
+    /// Agent considers a proposal (expresses interest).
+    pub fn consider(&mut self, proposal_id: u64, vessel: VesselId, confidence: Confidence) -> Option<&ProposalState> {
+        let p = self.proposals.get_mut(&proposal_id)?;
+        if p.has_voted(vessel) { return Some(&p.state); }
+        if p.state == ProposalState::Accepted || p.state == ProposalState::Rejected
+            || p.state == ProposalState::Forfeited || p.state == ProposalState::Expired {
+            return Some(&p.state);
         }
+        p.state = ProposalState::UnderConsideration;
+        p.round += 1;
+        p.confidence = p.confidence.combine(confidence);
+        Some(&p.state)
     }
 
-    /// Forfeit: agent concedes, transfers confidence to winner
-    pub fn forfeit(&mut self, proposal_id: u64) {
-        if let Some(p) = self.proposals.get_mut(proposal_id as usize) {
-            if p.forfeited { return; }
-            p.forfeited = true;
-            // Find best non-forfeited proposal
-            if let Some(best) = self.proposals.iter_mut()
-                .filter(|pp| !pp.forfeited && pp.id != proposal_id)
-                .max_by(|a, b| a.confidence.partial_cmp(&b.confidence).unwrap())
-            {
-                let transfer = p.confidence * 0.2;
-                best.confidence = (best.confidence + transfer).min(0.99);
-            }
+    /// Agent resolves (votes on) a proposal.
+    pub fn resolve(&mut self, proposal_id: u64, vessel: VesselId, accept: bool, confidence: Confidence) -> Option<ProposalAction> {
+        let p = self.proposals.get_mut(&proposal_id)?;
+        if p.has_voted(vessel) { return None; }
+        if p.state == ProposalState::Accepted || p.state == ProposalState::Rejected
+            || p.state == ProposalState::Forfeited {
+            return None;
         }
-    }
+        if accept {
+            p.votes_for.push((vessel, confidence));
+            p.confidence = p.confidence.combine(confidence);
+        } else {
+            p.votes_against.push((vessel, confidence));
+            p.confidence = p.confidence.discount(confidence.value());
+        }
 
-    /// Execute one deliberation round
-    pub fn deliberate_round(&mut self) -> RoundRecord {
-        self.round += 1;
-        let active: Vec<&Proposal> = self.proposals.iter().filter(|p| !p.forfeited).collect();
-        let best = active.iter().max_by(|a, b| a.confidence.partial_cmp(&b.confidence).unwrap());
-        let best_conf = best.map(|b| b.confidence).unwrap_or(0.0);
-        let forfeits = self.proposals.iter().filter(|p| p.forfeited).count();
-
-        // Auto-forfeit proposals significantly below best
-        if let Some(best_p) = best {
-            for p in &mut self.proposals {
-                if !p.forfeited && p.confidence < best_p.confidence - 0.3 {
-                    self.forfeit(p.id);
-                }
+        // Check auto-forfeit: if oppose confidence vastly exceeds support
+        let support_conf: f64 = p.votes_for.iter().map(|(_, c)| c.value()).sum();
+        let oppose_conf: f64 = p.votes_against.iter().map(|(_, c)| c.value()).sum();
+        if oppose_conf > 0.0 && support_conf > 0.0 {
+            let gap = oppose_conf / support_conf;
+            if gap > 1.0 / self.forfeit_gap.max(0.01) {
+                p.state = ProposalState::Forfeited;
+                return Some(ProposalAction::Forfeited);
             }
         }
 
-        let converged = best_conf >= self.convergence_threshold;
-        let record = RoundRecord {
-            round: self.round, proposals_count: active.len(),
-            best_confidence: best_conf, forfeits,
-            converged,
-        };
-        self.history.push(record.clone());
-        record
-    }
-
-    /// Check if deliberation has converged
-    pub fn is_converged(&self) -> bool {
-        self.history.last().map(|r| r.converged).unwrap_or(false)
-    }
-
-    /// Get the winning proposal
-    pub fn winner(&self) -> Option<&Proposal> {
-        self.proposals.iter().filter(|p| !p.forfeited)
-            .max_by(|a, b| a.confidence.partial_cmp(&b.confidence).unwrap())
-    }
-
-    /// Get deliberation summary
-    pub fn summary(&self) -> String {
-        let mut lines = vec![format!("Deliberation: {} rounds, {} proposals", self.round, self.proposals.len())];
-        for r in &self.history {
-            let status = if r.converged { "CONVERGED" } else { "continuing" };
-            lines.push(format!("  R{}: {} active, best={:.3}, {} forfeits, {}",
-                r.round, r.proposals_count, r.best_confidence, r.forfeits, status));
+        // Check acceptance
+        if p.consensus_ratio() >= 0.75 && p.votes_for.len() >= 2 {
+            p.state = ProposalState::Accepted;
+            return Some(ProposalAction::Accepted);
         }
-        if let Some(w) = self.winner() {
-            lines.push(format!("Winner: {} (conf={:.3})", w.agent, w.confidence));
+
+        // Check rejection
+        if p.consensus_ratio() <= 0.25 && p.votes_against.len() >= 2 {
+            p.state = ProposalState::Rejected;
+            return Some(ProposalAction::Rejected);
         }
-        lines.join("\n")
+
+        Some(ProposalAction::Continuing)
+    }
+
+    /// Agent forfeits (withdraws from consideration).
+    pub fn forfeit(&mut self, proposal_id: u64, vessel: VesselId, reason: &str) -> Option<ProposalAction> {
+        let p = self.proposals.get_mut(&proposal_id)?;
+        p.abstentions.push(vessel);
+        if p.confidence.value() < 0.2 {
+            p.state = ProposalState::Forfeited;
+            return Some(ProposalAction::Forfeited);
+        }
+        Some(ProposalAction::Continuing)
+    }
+
+    pub fn proposal(&self, id: u64) -> Option<&Proposal> { self.proposals.get(&id) }
+    pub fn proposals(&self) -> Vec<&Proposal> { self.proposals.values().collect() }
+    pub fn active_proposals(&self) -> Vec<&Proposal> {
+        self.proposals.values()
+            .filter(|p| matches!(p.state, ProposalState::Proposed | ProposalState::UnderConsideration))
+            .collect()
+    }
+
+    /// Summary of all proposals.
+    pub fn summary(&self) -> Vec<ProposalSummary> {
+        self.proposals.values().map(|p| ProposalSummary {
+            id: p.id, title: p.title.clone(), state: format!("{:?}", p.state),
+            confidence: p.confidence.value(), support: p.votes_for.len(),
+            oppose: p.votes_against.len(), round: p.round,
+        }).collect()
     }
 }
 
-/// Bayesian confidence combiner
-pub fn combine_confidence(c1: f64, c2: f64) -> f64 {
-    1.0 / (1.0 / c1.max(0.001) + 1.0 / c2.max(0.001))
+#[derive(Debug, Clone)]
+pub enum ProposalAction {
+    Accepted,
+    Rejected,
+    Forfeited,
+    Continuing,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProposalSummary {
+    pub id: u64,
+    pub title: String,
+    pub state: String,
+    pub confidence: f64,
+    pub support: usize,
+    pub oppose: usize,
+    pub round: u32,
 }
 
 #[cfg(test)]
@@ -143,34 +203,77 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_consider_and_resolve() {
-        let mut state = DeliberationState::new(10, 0.85);
-        let id = state.consider("architect", "builtin sorted", "sorted(data)", 0.9);
-        state.resolve(id, vec!["descending".to_string()], vec![]);
-        assert!(!state.is_converged());
+    fn test_propose() {
+        let mut e = DeliberationEngine::new(0.3);
+        let id = e.propose("test", VesselId(1), "A test proposal");
+        let p = e.proposal(id).unwrap();
+        assert_eq!(p.title, "test");
+        assert!(matches!(p.state, ProposalState::Proposed));
     }
 
     #[test]
-    fn test_forfeit_transfers_confidence() {
-        let mut state = DeliberationState::new(10, 0.85);
-        let good = state.consider("architect", "good approach", "good()", 0.9);
-        let bad = state.consider("novice", "bad approach", "bad()", 0.4);
-        state.forfeit(bad);
-        assert!(state.proposals[good as usize].confidence > 0.9);
+    fn test_consider_resolve() {
+        let mut e = DeliberationEngine::new(0.3);
+        let id = e.propose("adopt", VesselId(0), "Switch to Rust");
+        e.consider(id, VesselId(1), Confidence::LIKELY);
+        let action = e.resolve(id, VesselId(1), true, Confidence::SURE);
+        assert!(matches!(action, Some(ProposalAction::Continuing)));
     }
 
     #[test]
-    fn test_convergence() {
-        let mut state = DeliberationState::new(10, 0.85);
-        let id = state.consider("architect", "perfect", "fn()", 0.95);
-        state.resolve(id, vec![], vec![]);
-        state.deliberate_round();
-        assert!(state.is_converged());
+    fn test_acceptance() {
+        let mut e = DeliberationEngine::new(0.3);
+        let id = e.propose("merge", VesselId(0), "Merge branch");
+        e.resolve(id, VesselId(1), true, Confidence::SURE);
+        e.resolve(id, VesselId(2), true, Confidence::SURE);
+        let p = e.proposal(id).unwrap();
+        assert_eq!(p.state, ProposalState::Accepted);
     }
 
     #[test]
-    fn test_bayesian() {
-        assert!((combine_confidence(0.5, 0.5) - 0.25).abs() < 0.01);
-        assert!((combine_confidence(0.9, 0.9) - 0.45).abs() < 0.01);
+    fn test_rejection() {
+        let mut e = DeliberationEngine::new(0.3);
+        let id = e.propose("bad", VesselId(0), "A bad idea");
+        e.resolve(id, VesselId(1), false, Confidence::SURE);
+        e.resolve(id, VesselId(2), false, Confidence::SURE);
+        let p = e.proposal(id).unwrap();
+        assert_eq!(p.state, ProposalState::Rejected);
+    }
+
+    #[test]
+    fn test_forfeit() {
+        let mut e = DeliberationEngine::new(0.3);
+        let id = e.propose("drop", VesselId(0), "Drop it");
+        e.forfeit(id, VesselId(1), "not interested");
+        let action = e.resolve(id, VesselId(2), false, Confidence::SURE);
+        assert!(matches!(action, Some(ProposalAction::Forfeited)));
+    }
+
+    #[test]
+    fn test_no_double_vote() {
+        let mut e = DeliberationEngine::new(0.3);
+        let id = e.propose("vote", VesselId(0), "Test");
+        e.resolve(id, VesselId(1), true, Confidence::SURE);
+        let second = e.resolve(id, VesselId(1), false, Confidence::SURE);
+        assert!(second.is_none());
+    }
+
+    #[test]
+    fn test_summary() {
+        let mut e = DeliberationEngine::new(0.3);
+        e.propose("a", VesselId(0), "First");
+        e.propose("b", VesselId(0), "Second");
+        let s = e.summary();
+        assert_eq!(s.len(), 2);
+    }
+
+    #[test]
+    fn test_active_proposals() {
+        let mut e = DeliberationEngine::new(0.3);
+        e.propose("active", VesselId(0), "Active proposal");
+        let id2 = e.propose("reject", VesselId(0), "Will reject");
+        e.resolve(id2, VesselId(1), false, Confidence::SURE);
+        e.resolve(id2, VesselId(2), false, Confidence::SURE);
+        assert_eq!(e.active_proposals().len(), 1);
     }
 }
